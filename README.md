@@ -34,7 +34,7 @@ We actually have **perfect environment dynamics** for bin packing, so MCTS can s
 
 Expert Iteration outperforms PPO on BinPack-v2:
 
-![PPO vs Expert Iteration](ppo_vs_alphazero.gif)
+![PPO vs Expert Iteration](ppo_vs_muzero.gif)
 
 | Method | Volume Utilization | Training Time |
 |--------|-------------------|---------------|
