@@ -1,6 +1,6 @@
 # Expert Iteration RL with Gumbel MuZero in JAX
 
-**AlphaZero-style training for single-agent planning.** This repo combines [Expert Iteration](https://arxiv.org/abs/1705.08439) with [Gumbel MuZero](https://openreview.net/forum?id=bERaNdoegnO)—using Gumbel MCTS as the "expert" that generates policy improvement targets, then distilling them into a neural network. Applied to Jumanji's 3D BinPack environment, we achieve **96% volume utilization** vs PPO's 90%.
+**AlphaZero-style training for single-agent planning.** This repo combines [Expert Iteration](https://arxiv.org/abs/1705.08439) with [Gumbel MuZero](https://openreview.net/forum?id=bERaNdoegnO), using Gumbel MCTS as the "expert" that generates policy improvement targets, then distilling them into a fast neural policy—using JAX/XLA. Applied to Jumanji's 3D BinPack environment, we achieve **96% volume utilization** vs PPO's 90%.
 
 **[Read the full blog post](https://aneeshers.github.io/mctx_knapsack/)** for a deeper dive into the theory and implementation details.
 
