@@ -6,7 +6,7 @@ Applied to Jumanji's 3D BinPack environment, we achieve **96% volume utilization
 
 **[Read the full blog post](https://aneeshers.github.io/mctx_knapsack/)** for a deeper dive into the theory and implementation details.
 
-![Policy Iteration via Search Distillation for 3D Bin Packing](alphazero_binpack.gif)
+![Policy Iteration via Search Distillation for 3D Bin Packing](distill_binpack.gif)
 
 ## The Core Idea
 
