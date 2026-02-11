@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Expert Iteration / AlphaZero-Style Policy Iteration for 3D Bin Packing
+Policy Iteration via Search Distillation for 3D Bin Packing
 ================================================================================
 
-A clean implementation of AlphaZero-style training for Jumanji's
-Jax 3D BinPack environment. We see how to combine Monte Carlo Tree
-Search (MCTS) with neural network distillation to solve combinatorial optimization
-problems!
+A clean implementation of search-based policy iteration for Jumanji's
+JAX 3D BinPack environment. We use Monte Carlo Tree Search (MCTS) as a
+policy improvement operator, then distill the improved policy into a
+neural network via supervised learning.
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  This is NOT traditional self-play!                                         │
+│  MCTS as a Policy Improvement Operator                                      │
 │                                                                             │
 │  Unlike board games (Go, Chess), 3D bin packing is a single-agent planning  │
-│  task. We use MCTS to generate improved policy targets, then distill that   │
-│  knowledge into a neural network. This is "Expert Iteration" - the MCTS     │
-│  acts as an "expert" that teaches the network.                              │
+│  task with known dynamics. We use Gumbel MuZero search to compute improved  │
+│  policy targets—softmax(prior + Q)—then distill them into a neural network  │
+│  via cross-entropy. This is policy iteration: search is the improvement     │
+│  operator, supervised learning is how we internalize the improvement.       │
 │                                                                             │
-│  Paper: "Thinking Fast and Slow with Deep Learning and Tree Search"         │
-│  https://arxiv.org/abs/1705.08439                                           │
+│  Related work: "Thinking Fast and Slow with Deep Learning and Tree Search"  │
+│  (Expert Iteration) https://arxiv.org/abs/1705.08439                        │
+│                                                                             │
+│  Key difference: We use Gumbel MuZero's policy improvement operator         │
+│  softmax(prior + Q) rather than visit count proportions n(s,a)/n(s).        │
+│  See: https://openreview.net/forum?id=bERaNdoegnO                           │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 Why this approach beats PPO for bin packing:
-  1. MCTS provides high-quality action distributions (not just single samples)
-  2. We get exact environment dynamics (no need to learn a world model)
-  3. Policy improvement is guided by search, not just gradient signals
+  1. Search provides dense supervision (full action distributions, not samples)
+  2. We have exact environment dynamics (no need to learn a world model)
+  3. Policy improvement is guided by lookahead search, not just gradient signals
+  4. Reward influences policy indirectly through search, giving stable learning
 
 JAX parallelization:
   - jax.vmap: Vectorize over batch dimension (parallel episodes)
@@ -40,6 +46,8 @@ References and Acknowledgments:
     https://github.com/sotetsuk/pgx/tree/main/examples/alphazero
   - Expert Iteration paper:
     https://arxiv.org/abs/1705.08439
+  - Gumbel MuZero paper (our policy improvement operator):
+    https://openreview.net/forum?id=bERaNdoegnO
   - mctx library (DeepMind):
     https://github.com/google-deepmind/mctx
 
@@ -92,9 +100,9 @@ class Config(BaseModel):
     save_interval: int = 200          # Checkpoint every N iterations
     save_dir: str = "./checkpoints"
 
-    # MCTS / Data Collection
-    # These control the "expert" that generates training targets.
-    # More simulations = stronger expert = better targets (but slower)
+    # Search / Data Collection
+    # These control the search that generates training targets.
+    # More simulations = stronger policy improvement = better targets (but slower)
 
     rollout_batch_size: int = 1024    # Episodes per iteration (across all devices)
     num_simulations: int = 32         # MCTS simulations per decision
@@ -128,7 +136,7 @@ class Config(BaseModel):
 # CLI Parsing
 
 parser = argparse.ArgumentParser(
-    description="Expert Iteration for 3D Bin Packing",
+    description="Policy Iteration via Search Distillation for 3D Bin Packing",
     formatter_class=argparse.RawDescriptionHelpFormatter,
 )
 parser.add_argument("--num_simulations", type=int, default=8)
@@ -490,7 +498,7 @@ class BinPackEncoder(hk.Module):
 
 class BinPackPolicyValueNet(hk.Module):
     """
-    Combined policy and value network for AlphaZero-style training.
+    Combined policy and value network for search distillation.
 
     Outputs:
         - Policy logits: (batch, obs_num_ems * max_num_items)
@@ -656,27 +664,31 @@ def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state):
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                         Expert Iteration                                  ║
+# ║                    Policy Iteration via Search Distillation               ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 #
-# This is the core of Expert Iteration:
+# This is the core of search distillation:
 #
-#   1. Run episodes using MCTS at each decision point
-#   2. Record the MCTS action distribution (not just the chosen action!)
+#   1. Run episodes using Gumbel MuZero search at each decision point
+#   2. Record the search action distribution (not just the chosen action!)
 #   3. Use these distributions as training targets for the policy network
 #
-# The MCTS "action_weights" represent a much stronger policy than the raw
-# network output. By training to match these, we iteratively improve.
+# The search "action_weights" represent a much stronger policy than the raw
+# network output—computed as softmax(prior + Q), a direct policy improvement
+# operator. By training to match these, we iteratively improve the policy.
 #
 # Unlike policy gradient methods (PPO, A2C), we train on the
 # full action distribution from search, not just sampled actions. This
-# provides much richer learning signal!
+# provides much richer learning signal and more stable training!
+#
+# Key insight: reward doesn't appear in the policy loss. It only influences
+# the policy indirectly through how search evaluates actions.
 
 
 class RolloutData(NamedTuple):
     """Data collected from a single rollout step."""
     observation: object          # Observation pytree
-    action_weights: jnp.ndarray  # MCTS policy distribution (training target!)
+    action_weights: jnp.ndarray  # Search policy distribution (training target!)
     reward: jnp.ndarray          # Step reward
     discount: jnp.ndarray        # Discount factor (0 at terminal)
     mask: jnp.ndarray            # True for valid decision steps
@@ -685,13 +697,13 @@ class RolloutData(NamedTuple):
 @jax.pmap
 def collect_experience(model, rng_key: jnp.ndarray) -> Tuple[RolloutData, object, jnp.ndarray]:
     """
-    Collect training data by running MCTS-guided episodes.
+    Collect training data by running search-guided episodes.
 
     This function:
     1. Resets a batch of environments
-    2. At each step, runs MCTS to get an improved policy
-    3. Samples actions from MCTS distribution
-    4. Records (observation, mcts_policy, reward, discount) tuples
+    2. At each step, runs Gumbel MuZero search to get an improved policy
+    3. Samples actions from search distribution
+    4. Records (observation, search_policy, reward, discount) tuples
 
     Args:
         model: Replicated (params, state) tuple
@@ -718,7 +730,7 @@ def collect_experience(model, rng_key: jnp.ndarray) -> Tuple[RolloutData, object
     # jax.lax.scan is much more efficient than Python loops (ussually - depends on how you JIT)!
     # It compiles the loop body once and executes it repeatedly.
     def step_fn(carry, step_key):
-        """Single rollout step with MCTS action selection."""
+        """Single rollout step with search-based action selection."""
         state, timestep, done = carry
         observation = timestep.observation
 
@@ -736,7 +748,7 @@ def collect_experience(model, rng_key: jnp.ndarray) -> Tuple[RolloutData, object
             )
 
         def do_step():
-            """Run MCTS and step the environment."""
+            """Run search and step the environment."""
             
             # eval network at current state
             (logits, value), _ = forward.apply(
@@ -746,11 +758,11 @@ def collect_experience(model, rng_key: jnp.ndarray) -> Tuple[RolloutData, object
             valid_mask = get_valid_action_mask(observation.action_mask)
             root_logits = apply_action_mask(logits, valid_mask)
 
-            # Run MCTS
-            # gumbel_muzero_policy: A variant that uses Gumbel-Top-k sampling
-            # for better exploration during search. The "action_weights" output
-            # is a probability distribution over actions.
-            # See: https://iclr.cc/media/iclr-2022/Slides/6418.pdf (Gumbel MuZero)
+            # Run Gumbel MuZero search
+            # gumbel_muzero_policy: Uses Gumbel-Top-k sampling for exploration
+            # and computes action_weights = softmax(prior + Q), a direct
+            # policy improvement operator with finite-sample guarantees.
+            # See: https://openreview.net/forum?id=bERaNdoegnO
             root = mctx.RootFnOutput(
                 prior_logits=root_logits,
                 value=value,
@@ -815,11 +827,14 @@ def collect_experience(model, rng_key: jnp.ndarray) -> Tuple[RolloutData, object
 # Compute Monte-Carlo returns as value targets.
 # For BinPack with dense reward, the return is simply the sum of rewards
 # (volume added at each step), which equals final utilization ∈ [0, 1].
+#
+# Note: The value head is trained from MC returns, not from search values.
+# Only the policy is "search-improved"; the value learns from experience.
 
 class TrainingSample(NamedTuple):
     """Processed sample ready for training."""
     observation: object          # Observation pytree
-    policy_target: jnp.ndarray   # MCTS action distribution
+    policy_target: jnp.ndarray   # Search action distribution
     value_target: jnp.ndarray    # Monte-Carlo return
     mask: jnp.ndarray            # Valid sample indicator
 
@@ -873,10 +888,13 @@ def compute_value_targets(data: RolloutData) -> TrainingSample:
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 #
 # Loss function combines:
-#   1. Policy loss: Cross-entropy between network output and MCTS distribution
+#   1. Policy loss: Cross-entropy between network output and search distribution
 #   2. Value loss: L2 loss between predicted and Monte-Carlo return
-# The policy loss is the key to Expert Iteration: we distill MCTS's
-# improved policy back into the network.
+#
+# The policy loss is the key to search distillation: we train the network
+# to imitate the search-improved policy via supervised learning.
+# This is fundamentally different from policy gradients—reward doesn't
+# appear in the policy loss at all!
 
 
 def compute_loss(
@@ -903,8 +921,9 @@ def compute_loss(
     mask = batch.mask.astype(jnp.float32)
     num_valid = jnp.maximum(jnp.sum(mask), 1.0)  # Avoid division by zero
 
-    # Policy Loss: Cross-entropy with MCTS distribution
-    # This is the distillation loss: teach the network to match MCTS's policy
+    # Policy Loss: Cross-entropy with search distribution
+    # This is the distillation loss: teach the network to match search's policy
+    # Note: This is imitation learning, not policy gradients!
     policy_loss_per_sample = optax.softmax_cross_entropy(logits, batch.policy_target)
     policy_loss = jnp.sum(policy_loss_per_sample * mask) / num_valid
 
@@ -1126,14 +1145,20 @@ def evaluate_mcts(model, rng_key: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray
 # ║                            Main  Loop                                     ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 #
-# The Expert Iteration algorithm:
+# The Policy Iteration via Search Distillation algorithm:
+#
 #   for iteration in range(max_iterations):
-#       1. COLLECT: Run episodes with MCTS, record (obs, mcts_policy, reward)
+#       1. COLLECT: Run episodes with search, record (obs, search_policy, reward)
 #       2. COMPUTE: Calculate value targets (Monte-Carlo returns)
-#       3. TRAIN: Update network to match MCTS policy and value targets
-#       4. REPEAT: The improved network makes MCTS even better next iteration
-# This creates a virtuous cycle: better network → better MCTS → better targets
+#       3. TRAIN: Update network to match search policy (cross-entropy)
+#                 and value targets (MSE)
+#       4. REPEAT: The improved network makes search even better next iteration
+#
+# This creates a virtuous cycle: better network → better search → better targets
 # → even better network → ...
+#
+# Key insight: This is policy iteration where search is the improvement operator
+# and supervised learning is how we internalize the improvement.
 
 
 if __name__ == "__main__":
@@ -1187,7 +1212,7 @@ if __name__ == "__main__":
     total_hours = 0.0
 
     print("=" * 60)
-    print("Starting Expert Iteration Training")
+    print("Starting Policy Iteration via Search Distillation")
     print("=" * 60)
 
     # Main Loop
@@ -1245,7 +1270,7 @@ if __name__ == "__main__":
             break
 
         # STEP 1: Collect exp
-        # Run MCTS-guided rollouts across all devices in parallel.
+        # Run search-guided rollouts across all devices in parallel.
         # Each device handles (rollout_batch_size / num_devices) episodes.
         iter_start = time.time()
 
@@ -1330,7 +1355,7 @@ if __name__ == "__main__":
             "rollout/avg_steps": avg_rollout_length,
             "train/policy_loss": avg_policy_loss,
             "train/value_loss": avg_value_loss,
-            "mcts/num_simulations": config.num_simulations,
+            "search/num_simulations": config.num_simulations,
         }
         wandb.log(metrics)
 

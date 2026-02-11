@@ -4,12 +4,12 @@ PPO Training for 3D Bin Packing
 ===============================
 
 A clean implementation of PPO for the Jumanji 3D BinPack environment. 
-This serves as a baseline comparison to our Expert Iteration / AlphaZero-style approach.
+This serves as a baseline comparison to our Policy Iteration Policy Iteration via Search Distillation approach.
 
-Why compare PPO vs Expert Iteration?
+Why compare PPO vs Search Distillation?
 ------------------------------------
-PPO learns from sampled actions and scalar rewards. Expert Iteration learns
-from full MCTS action distributions. The difference: Expert Iteration gets
+PPO learns from sampled actions and scalar rewards. Policy Iteration learns
+from full MCTS action distributions. The difference is that Policy Iteration gets
 a much richer training signal at each step, which is why it tends to outperform
 PPO on planning-heavy tasks like bin packing.
 
@@ -85,7 +85,7 @@ class Config(BaseModel):
     training_batch_size: int = 4096   # samples per update (across devices)
     learning_rate: float = 3e-4
 
-    # nn architecture (same as Expert Iteration for fair comparison)
+    # nn architecture (same as Policy Iteration for fair comparison)
     num_transformer_layers: int = 4
     transformer_num_heads: int = 4
     transformer_key_size: int = 32
@@ -221,7 +221,7 @@ def entropy_from_log_probs(log_probs: jnp.ndarray) -> jnp.ndarray:
 # =============================================================================
 # NN
 # =============================================================================
-# Same Transformer architecture as Expert Iteration for fair comparison.
+# Same Transformer architecture as Policy Iteration for fair comparison.
 # Cross-attention between EMS (empty spaces) and items is the key insight.
 #
 # Architecture:
@@ -484,7 +484,7 @@ def compute_gae(
 # Exp collection
 # =============================================================================
 # Run episodes with current policy, record (obs, action, reward, ...) tuples.
-# This is where PPO differs from Expert Iteration: we sample single actions
+# This is where PPO differs from Policy Iteration: we sample single actions
 # from the policy, not full distributions from MCTS.
 
 @jax.pmap
