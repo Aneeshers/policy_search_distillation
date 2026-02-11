@@ -59,7 +59,7 @@ Reward doesn't appear in this loss—it only influences the policy *indirectly* 
 
 Search distillation outperforms PPO on BinPack-v2:
 
-![PPO vs Search Distillation](ppo_vs_muzero.gif)
+![PPO vs Search Distillation](ppo_vs_distill.gif)
 
 | Method | Volume Utilization | Training Time |
 |--------|-------------------|---------------|
