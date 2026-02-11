@@ -1,44 +1,69 @@
-# Expert Iteration RL with Gumbel MuZero in JAX
+# Policy Iteration via Search Distillation
 
-**Gumbel Muzero-style training for single-agent planning.** This repo combines [Expert Iteration](https://arxiv.org/abs/1705.08439) with [Gumbel MuZero](https://openreview.net/forum?id=bERaNdoegnO), using Gumbel MCTS as the "expert" that generates policy improvement targets, then distilling them into a fast neural policy using JAX/XLA. Applied to Jumanji's 3D BinPack environment, we achieve **96% volume utilization** vs PPO's 90%.
+**MCTS as a policy improvement operator.** For single-agent planning with known dynamics, we use Gumbel MuZero search to compute improved policy targets—`softmax(prior + Q)`—then distill them into a neural network via cross-entropy. This is policy iteration, but the "improvement" step is search and the "evaluation" step is supervised learning. Pure JAX, competitive with PPO on wall-clock time.
+
+Applied to Jumanji's 3D BinPack environment, we achieve **96% volume utilization** vs PPO's 90%.
 
 **[Read the full blog post](https://aneeshers.github.io/mctx_knapsack/)** for a deeper dive into the theory and implementation details.
 
-![Expert Iteration for 3D Bin Packing](alphazero_binpack.gif)
+![Policy Iteration via Search Distillation for 3D Bin Packing](alphazero_binpack.gif)
 
-## Why Expert Iteration?
+## The Core Idea
 
-Traditional AlphaZero uses self-play because Go and Chess are two-player games. But 3D bin packing is a **single-agent planning task**—there's no opponent. So instead of self-play, we use MCTS to generate training targets directly:
+When AlphaZero achieved [superhuman performance at Go and Chess](https://www.youtube.com/watch?v=Wujy7OzvdJk), the key innovation was how MCTS and neural networks reinforced each other. But AlphaZero uses *self-play* because Go and Chess are two-player games.
 
-> **Note:** This isn't vanilla Expert Iteration. We use **Gumbel MuZero** as the expert, which provides stronger policy improvement guarantees for large action spaces with limited simulation budgets. The `action_weights` from mctx aren't visit count proportions (like in the original EXIT paper); they're computed as `softmax(prior_logits + completed_Q)`, directly implementing the policy improvement operator from [Danihelka et al. (2022)](https://openreview.net/forum?id=bERaNdoegnO).
+3D bin packing is different—there's no opponent. It's a **single-agent planning task with known dynamics**. For problems like this, self-play doesn't apply. Instead, we run search on each state and distill the resulting action distribution into a neural network:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                                                                             │
 │   ┌─────────┐      improved       ┌─────────┐      distill      ┌───────┐   │
-│   │  MCTS   │ ───────────────────►│ Policy  │ ─────────────────►│  NN   │   │
-│   │ Search  │      targets        │ Targets │      into         │Policy │   │
+│   │ Gumbel  │ ───────────────────►│ Policy  │ ─────────────────►│  NN   │   │
+│   │ MuZero  │      targets        │ Targets │      into         │Policy │   │
 │   └─────────┘                     └─────────┘                   └───────┘   │
 │        ▲                                                            │       │
 │        │                          next iteration                    │       │
 │        └────────────────────────────────────────────────────────────┘       │
 │                                                                             │
-│   The network improves → MCTS becomes stronger → better targets → ...       │
+│   The network improves → search becomes stronger → better targets → ...     │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-We actually have **perfect environment dynamics** for bin packing, so MCTS can simulate exact state transitions, and it can act as a strong "expert" that teaches the network. This is fundamentally different from model-based RL where you'd need to learn the dynamics.
+This is **policy iteration**: search is the improvement operator, supervised learning is how we internalize the improvement.
+
+### Relationship to Expert Iteration
+
+This approach is closely related to [Expert Iteration](https://arxiv.org/abs/1705.08439) (Anthony et al., 2017), which frames the same idea as "MCTS is an expert teacher, the network is an apprentice." However, there are meaningful differences:
+
+| Aspect | Traditional EXIT | This Implementation |
+|--------|------------------|---------------------|
+| Policy target | `n(s,a) / n(s)` (visit counts) | `softmax(prior + Q)` (policy improvement) |
+| Root exploration | UCT + Dirichlet noise | Gumbel-Top-k + Sequential Halving |
+| Theoretical guarantee | Asymptotic (infinite simulations) | Finite-sample policy improvement |
+| Value targets | MCTS root values | Monte Carlo returns |
+
+We use **Gumbel MuZero** as the search algorithm, which computes `softmax(prior_logits + completed_Q)` as targets—a direct policy improvement operator from [Danihelka et al. (2022)](https://openreview.net/forum?id=bERaNdoegnO). This provides stronger guarantees when simulation budgets are small relative to the action space (like our 800 actions with 32 simulations).
+
+### Why This Is Not PPO
+
+The policy is trained by **imitation**, not policy gradients:
+
+```
+L_policy(θ) = -Σ_a π_search(a|s) log π_θ(a|s)
+```
+
+Reward doesn't appear in this loss—it only influences the policy *indirectly* through how search evaluates actions. The supervision signal is dense (a full distribution over 800 actions) rather than sparse (a single sampled action and its return). This is why learning curves are stable compared to PPO.
 
 ## Results
 
-Expert Iteration outperforms PPO on BinPack-v2:
+Search distillation outperforms PPO on BinPack-v2:
 
-![PPO vs Expert Iteration](ppo_vs_muzero.gif)
+![PPO vs Search Distillation](ppo_vs_muzero.gif)
 
 | Method | Volume Utilization | Training Time |
 |--------|-------------------|---------------|
-| Expert Iteration (32 sims) | **96%** | ~4 hours |
+| Search Distillation (32 sims) | **96%** | ~4 hours |
 | PPO | 90% | ~4 hours |
 
 Despite running 32 MCTS simulations per decision, JAX parallelism keeps wall-clock time competitive with PPO.
@@ -64,7 +89,7 @@ pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-re
 
 ## Quick Start
 
-### Train Expert Iteration
+### Train Search Distillation
 
 ```bash
 # Default settings (32 MCTS simulations, seed 0)
@@ -92,12 +117,12 @@ python train_ppo_binpack.py --seed 42
 Both scripts log to [Weights & Biases](https://wandb.ai). Key metrics:
 - `rollout/avg_return`: Volume utilization during data collection
 - `eval/greedy/avg_return`: Greedy policy performance
-- `train/policy_loss`: Cross-entropy with MCTS targets (Expert Iteration) or PPO surrogate loss
+- `train/policy_loss`: Cross-entropy with search targets (Search Distillation) or PPO surrogate loss
 
 ## Code Structure
 
 ```
-├── train_expert_iteration_binpack.py   # Main Expert Iteration training script
+├── train_expert_iteration_binpack.py   # Main search distillation training script
 ├── train_ppo_binpack.py                # PPO baseline for comparison
 ├── checkpoints/                        # Saved model checkpoints
 └── README.md
@@ -168,23 +193,11 @@ policy_output = mctx.gumbel_muzero_policy(
     invalid_actions=~valid_mask,
 )
 
-# Training target: the MCTS action distribution
-mcts_policy = policy_output.action_weights
+# Training target: the search action distribution
+search_policy = policy_output.action_weights
 ```
 
 We use `gumbel_muzero_policy` rather than vanilla MCTS because it handles large action spaces better with small simulation budgets (see [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO)).
-
-### Gumbel MuZero vs Traditional MCTS
-
-This distinction matters for understanding what we're training on:
-
-| Aspect | Traditional EXIT (Anthony et al.) | This Implementation |
-|--------|-----------------------------------|---------------------|
-| Policy target | `n(s,a) / n(s)` (visit counts) | `softmax(prior + Q)` (policy improvement) |
-| Root exploration | UCT + Dirichlet noise | Gumbel-Top-k + Sequential Halving |
-| Theoretical guarantee | Asymptotic (infinite simulations) | Finite-sample policy improvement |
-
-The original [Expert Iteration paper](https://arxiv.org/abs/1705.08439) uses visit count proportions as targets—the idea being that MCTS visits better actions more often. Gumbel MuZero instead computes targets by *directly applying a policy improvement operator*: it adds the completed Q-values to the prior logits and takes a softmax. This provides stronger guarantees when simulation budgets are small relative to the action space (like our 800 actions with 32 simulations).
 
 ### Neural Network Architecture
 
@@ -226,21 +239,21 @@ class BinPackPolicyValueNet(hk.Module):
 
 ### Training Loop
 
-The Expert Iteration training loop:
+The search distillation training loop:
 
 ```python
 for iteration in range(max_iterations):
-    # 1. Collect experience with MCTS-guided rollouts
-    #    At each step, run MCTS and record (obs, mcts_policy, reward)
+    # 1. Collect experience with search-guided rollouts
+    #    At each step, run MCTS and record (obs, search_policy, reward)
     rollout_data = collect_experience(model, rng_key)
     
     # 2. Compute Monte-Carlo value targets
     #    V(t) = r(t) + γ·r(t+1) + γ²·r(t+2) + ...
     training_samples = compute_value_targets(rollout_data)
     
-    # 3. Train network to match MCTS policy and MC returns
+    # 3. Train network to match search policy and MC returns
     for minibatch in shuffle_and_batch(training_samples):
-        # Loss = CE(π_θ, mcts_policy) + λ·MSE(V_θ, mc_return)
+        # Loss = CE(π_θ, search_policy) + λ·MSE(V_θ, mc_return)
         model, opt_state = train_step(model, opt_state, minibatch)
 ```
 
@@ -260,11 +273,11 @@ def train_step(model, opt_state, batch):
     ...
 ```
 
-On 4 GPUs with batch size 1024, we process ~20,000 MCTS-guided decisions per second.
+On 4 GPUs with batch size 1024, we process ~20,000 search-guided decisions per second.
 
 ## Configuration
 
-### Expert Iteration (`train_expert_iteration_binpack.py`)
+### Search Distillation (`train_expert_iteration_binpack.py`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -395,11 +408,11 @@ model = jax.device_put_replicated(model, devices)
 ## References
 
 **Blog Post:**
-- [Expert Iteration with Gumbel MuZero for 3D Bin Packing](https://aneeshers.github.io/mctx_knapsack/) — Full writeup with theory and implementation details
+- [Policy Iteration via Search Distillation for 3D Bin Packing](https://aneeshers.github.io/mctx_knapsack/) — Full writeup with theory and implementation details
 
 **Papers:**
 - [Expert Iteration (Anthony et al., 2017)](https://arxiv.org/abs/1705.08439) — The MCTS-as-teacher framework we build on
-- [Gumbel MuZero (Danihelka et al., 2022)](https://openreview.net/forum?id=bERaNdoegnO) — Policy improvement via Gumbel-Top-k; how our expert computes targets
+- [Gumbel MuZero (Danihelka et al., 2022)](https://openreview.net/forum?id=bERaNdoegnO) — Policy improvement via Gumbel-Top-k; how our search computes targets
 - [PPO (Schulman et al., 2017)](https://arxiv.org/abs/1707.06347) — Baseline algorithm
 - [Jumanji (Bonnet et al., 2023)](https://arxiv.org/abs/2306.09884) — Environment suite
 
@@ -411,11 +424,11 @@ model = jax.device_put_replicated(model, devices)
 ## Citation
 
 ```bibtex
-@misc{muppidi2026gumbelexit,
-  title={Expert Iteration with Gumbel MuZero},
+@misc{muppidi2026searchdistill,
+  title={Policy Iteration via Search Distillation},
   author={Muppidi, Aneesh},
   year={2026},
-  url={https://github.com/Aneeshers/expert-iteration-rl}
+  url={https://github.com/Aneeshers/policy_search_distillation}
 }
 ```
 
